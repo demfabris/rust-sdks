@@ -14,18 +14,18 @@
 
 use std::{
     fmt::{Debug, Formatter},
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use lazy_static::lazy_static;
 use libwebrtc::prelude::*;
-use parking_lot::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 
 lazy_static! {
-    static ref LK_RUNTIME: Mutex<Weak<LkRuntime>> = Mutex::new(Weak::new());
+    static ref LK_RUNTIME: Arc<LkRuntime> =
+        Arc::new(LkRuntime { pc_factory: PeerConnectionFactory::default() });
 }
 
 pub struct LkRuntime {
@@ -40,15 +40,7 @@ impl Debug for LkRuntime {
 
 impl LkRuntime {
     pub fn instance() -> Arc<LkRuntime> {
-        let mut lk_runtime_ref = LK_RUNTIME.lock();
-        if let Some(lk_runtime) = lk_runtime_ref.upgrade() {
-            lk_runtime
-        } else {
-            log::debug!("LkRuntime::new()");
-            let new_runtime = Arc::new(Self { pc_factory: PeerConnectionFactory::default() });
-            *lk_runtime_ref = Arc::downgrade(&new_runtime);
-            new_runtime
-        }
+        LK_RUNTIME.clone()
     }
 
     pub fn pc_factory(&self) -> &PeerConnectionFactory {
@@ -280,5 +272,22 @@ impl LkRuntime {
 impl Drop for LkRuntime {
     fn drop(&mut self) {
         log::debug!("LkRuntime::drop()");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_reuses_process_runtime_after_previous_handle_drops() {
+        let first = LkRuntime::instance();
+        let first_ptr = Arc::as_ptr(&first);
+
+        drop(first);
+
+        let second = LkRuntime::instance();
+
+        assert_eq!(first_ptr, Arc::as_ptr(&second));
     }
 }

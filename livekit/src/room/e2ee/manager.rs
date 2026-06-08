@@ -92,6 +92,7 @@ impl E2eeManager {
             cryptor.set_enabled(false);
         }
         inner.frame_cryptors.clear();
+        *self.state_changed.lock() = None;
     }
 
     /// Register to e2ee state changes
@@ -374,5 +375,17 @@ mod tests {
         let features = [PacketTrailerFeature::PtfFrameId as i32];
 
         assert!(needs_video_receiver_packet_trailer_handler(&features));
+    }
+
+    #[test]
+    fn cleanup_clears_state_changed_handler() {
+        let manager = E2eeManager::new(None, false);
+        manager.on_state_changed(|_, _| {});
+
+        assert!(manager.state_changed.lock().is_some());
+
+        manager.cleanup();
+
+        assert!(manager.state_changed.lock().is_none());
     }
 }
