@@ -406,7 +406,10 @@ impl EngineInner {
                 async move {
                     let (session, join_response, session_events) =
                         RtcSession::connect(url, token, options.clone(), e2ee_manager).await?;
-                    session.wait_pc_connection().await?;
+                    if let Err(error) = session.wait_pc_connection().await {
+                        session.close(DisconnectReason::ConnectionTimeout).await;
+                        return Err(error);
+                    }
 
                     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
                     let mut interval = interval(RECONNECT_INTERVAL);
@@ -909,7 +912,10 @@ impl EngineInner {
         let _ = self.engine_tx.send(EngineEvent::SignalRestarted { join_response, tx });
         let _ = rx.await;
 
-        new_session.wait_pc_connection().await?;
+        if let Err(error) = new_session.wait_pc_connection().await {
+            new_session.close(DisconnectReason::ConnectionTimeout).await;
+            return Err(error);
+        }
 
         // Only replace the current session if the new one succeed
         // This is important so we can still use the old session if the new one failed
