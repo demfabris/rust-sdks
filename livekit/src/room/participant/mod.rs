@@ -177,6 +177,17 @@ pub(super) struct ParticipantInner {
     is_data_encrypted: RwLock<Option<bool>>,
 }
 
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for ParticipantInner {
+    fn drop(&mut self) {
+        eprintln!(
+            "LK_LEAK_PROBE ParticipantInner::drop identity={} engine_ptr={:p}",
+            self.info.read().identity.0,
+            self.rtc_engine.inner_weak().as_ptr(),
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct ParticipantTrackPermission {
     pub participant_identity: ParticipantIdentity,
@@ -198,6 +209,12 @@ pub(super) fn new_inner(
     permission: Option<proto::ParticipantPermission>,
     client_protocol: i32,
 ) -> Arc<ParticipantInner> {
+    #[cfg(feature = "__lk-e2e-test")]
+    eprintln!(
+        "LK_LEAK_PROBE ParticipantInner::new identity={} engine_ptr={:p}",
+        identity.0,
+        rtc_engine.inner_weak().as_ptr(),
+    );
     Arc::new(ParticipantInner {
         rtc_engine,
         info: RwLock::new(ParticipantInfo {
