@@ -537,7 +537,11 @@ impl Debug for RoomSession {
 #[cfg(feature = "__lk-e2e-test")]
 impl Drop for RoomSession {
     fn drop(&mut self) {
-        eprintln!("LK_LEAK_PROBE RoomSession::drop");
+        eprintln!(
+            "LK_LEAK_PROBE RoomSession::drop room={} engine_ptr={:p}",
+            self.info.read().name,
+            self.rtc_engine.inner_weak().as_ptr(),
+        );
     }
 }
 

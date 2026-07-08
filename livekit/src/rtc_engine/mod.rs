@@ -459,7 +459,7 @@ impl RtcEngine {
 #[cfg(feature = "__lk-e2e-test")]
 impl Drop for EngineInner {
     fn drop(&mut self) {
-        eprintln!("LK_LEAK_PROBE EngineInner::drop");
+        eprintln!("LK_LEAK_PROBE EngineInner::drop engine_ptr={:p}", self as *const Self);
     }
 }
 
