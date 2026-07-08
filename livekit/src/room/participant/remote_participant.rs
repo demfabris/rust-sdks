@@ -15,7 +15,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -62,6 +62,18 @@ struct RemoteInfo {
 pub struct RemoteParticipant {
     inner: Arc<ParticipantInner>,
     remote: Arc<RemoteInfo>,
+}
+
+#[derive(Clone)]
+pub(super) struct WeakRemoteParticipant {
+    inner: Weak<ParticipantInner>,
+    remote: Weak<RemoteInfo>,
+}
+
+impl WeakRemoteParticipant {
+    pub(super) fn upgrade(&self) -> Option<RemoteParticipant> {
+        Some(RemoteParticipant { inner: self.inner.upgrade()?, remote: self.remote.upgrade()? })
+    }
 }
 
 impl Debug for RemoteParticipant {
@@ -114,6 +126,29 @@ impl RemoteParticipant {
         self.inner.track_publications.read().clone()
     }
 
+    pub(super) fn downgrade(&self) -> WeakRemoteParticipant {
+        WeakRemoteParticipant {
+            inner: Arc::downgrade(&self.inner),
+            remote: Arc::downgrade(&self.remote),
+        }
+    }
+
+    pub(crate) fn mark_disconnected(&self) {
+        super::mark_disconnected(&self.inner);
+    }
+
+    fn is_disconnected(&self) -> bool {
+        super::is_disconnected(&self.inner)
+    }
+
+    fn log_skipped_disconnected_publication(&self, sid: &TrackSid, action: &str) {
+        log::debug!(
+            "skipping {action} for disconnected remote participant {} track {}",
+            self.sid(),
+            sid
+        );
+    }
+
     pub(crate) async fn add_subscribed_media_track(
         &self,
         sid: TrackSid,
@@ -136,6 +171,11 @@ impl RemoteParticipant {
         };
 
         if let Ok(remote_publication) = timeout(ADD_TRACK_TIMEOUT, wait_publication).await {
+            if self.is_disconnected() {
+                self.log_skipped_disconnected_publication(&sid, "subscribed media track add");
+                return;
+            }
+
             let track = match remote_publication.kind() {
                 TrackKind::Audio => {
                     if let MediaStreamTrack::Audio(rtc_track) = media_track {
@@ -176,10 +216,25 @@ impl RemoteParticipant {
             });
 
             self.add_publication(TrackPublication::Remote(remote_publication.clone()));
+            if self.is_disconnected() {
+                self.remove_publication(&remote_publication.sid());
+                self.log_skipped_disconnected_publication(
+                    &sid,
+                    "post-disconnect subscribed media track insert",
+                );
+                return;
+            }
             track.enable();
 
             remote_publication.set_track(Some(track)); // This will fire TrackSubscribed on the
                                                        // publication
+            if self.is_disconnected() {
+                self.remove_publication(&remote_publication.sid());
+                self.log_skipped_disconnected_publication(
+                    &sid,
+                    "post-disconnect subscribed media track callback",
+                );
+            }
         } else {
             log::error!("could not find published track with sid: {:?}", sid);
 
@@ -219,11 +274,24 @@ impl RemoteParticipant {
             let track_sid = track.sid.clone().try_into().unwrap();
             if let Some(publication) = self.get_track_publication(&track_sid) {
                 publication.update_info(track.clone());
+            } else if self.is_disconnected() {
+                self.log_skipped_disconnected_publication(
+                    &track_sid,
+                    "participant-info publication add",
+                );
             } else {
                 let publication =
                     RemoteTrackPublication::new(track.clone(), None, self.remote.auto_subscribe);
 
                 self.add_publication(TrackPublication::Remote(publication.clone()));
+                if self.is_disconnected() {
+                    self.remove_publication(&track_sid);
+                    self.log_skipped_disconnected_publication(
+                        &track_sid,
+                        "post-disconnect participant-info publication insert",
+                    );
+                    continue;
+                }
 
                 // This is a new track, dispatch publish event
                 if let Some(track_published) = self.remote.events.track_published.lock().as_ref() {
@@ -358,10 +426,12 @@ impl RemoteParticipant {
         };
 
         publication.on_subscription_update_needed({
-            let rtc_engine = self.inner.rtc_engine.clone();
+            let rtc_engine = Arc::downgrade(&self.inner.rtc_engine);
             let psid = self.sid();
             move |publication, subscribed| {
-                let rtc_engine = rtc_engine.clone();
+                let Some(rtc_engine) = rtc_engine.upgrade() else {
+                    return;
+                };
                 let psid = psid.clone();
                 livekit_runtime::spawn(async move {
                     let tsid: String = publication.sid().into();
@@ -385,28 +455,36 @@ impl RemoteParticipant {
 
         publication.on_subscribed({
             let events = self.remote.events.clone();
-            let participant = self.clone();
+            let participant = self.downgrade();
             move |publication, track| {
+                let Some(participant) = participant.upgrade() else {
+                    return;
+                };
                 if let Some(track_subscribed) = events.track_subscribed.lock().as_ref() {
-                    track_subscribed(participant.clone(), publication, track);
+                    track_subscribed(participant, publication, track);
                 }
             }
         });
 
         publication.on_unsubscribed({
             let events = self.remote.events.clone();
-            let participant = self.clone();
+            let participant = self.downgrade();
             move |publication, track| {
+                let Some(participant) = participant.upgrade() else {
+                    return;
+                };
                 if let Some(track_unsubscribed) = events.track_unsubscribed.lock().as_ref() {
-                    track_unsubscribed(participant.clone(), publication, track);
+                    track_unsubscribed(participant, publication, track);
                 }
             }
         });
 
         publication.on_enabled_status_changed({
-            let rtc_engine = self.inner.rtc_engine.clone();
+            let rtc_engine = Arc::downgrade(&self.inner.rtc_engine);
             move |publication, enabled| {
-                let rtc_engine = rtc_engine.clone();
+                let Some(rtc_engine) = rtc_engine.upgrade() else {
+                    return;
+                };
                 livekit_runtime::spawn(async move {
                     let tsid: String = publication.sid().into();
                     let TrackDimension(width, height) = publication.dimension();
@@ -428,9 +506,11 @@ impl RemoteParticipant {
         });
 
         publication.on_video_dimensions_changed({
-            let rtc_engine = self.inner.rtc_engine.clone();
+            let rtc_engine = Arc::downgrade(&self.inner.rtc_engine);
             move |publication, dimension| {
-                let rtc_engine = rtc_engine.clone();
+                let Some(rtc_engine) = rtc_engine.upgrade() else {
+                    return;
+                };
                 livekit_runtime::spawn(async move {
                     let tsid: String = publication.sid().into();
                     let TrackDimension(width, height) = dimension;
@@ -453,9 +533,11 @@ impl RemoteParticipant {
         });
 
         publication.on_video_quality_changed({
-            let rtc_engine = self.inner.rtc_engine.clone();
+            let rtc_engine = Arc::downgrade(&self.inner.rtc_engine);
             move |publication, quality| {
-                let rtc_engine = rtc_engine.clone();
+                let Some(rtc_engine) = rtc_engine.upgrade() else {
+                    return;
+                };
                 livekit_runtime::spawn(async move {
                     let tsid: String = publication.sid().into();
                     let quality = match quality {
@@ -492,6 +574,9 @@ impl RemoteParticipant {
             publication.on_subscription_update_needed(|_, _| {});
             publication.on_subscribed(|_, _| {});
             publication.on_unsubscribed(|_, _| {});
+            publication.on_enabled_status_changed(|_, _| {});
+            publication.on_video_dimensions_changed(|_, _| {});
+            publication.on_video_quality_changed(|_, _| {});
         }
 
         publication

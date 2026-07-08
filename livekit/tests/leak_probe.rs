@@ -14,10 +14,12 @@
 
 #![cfg(feature = "__lk-e2e-test")]
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use common::audio::{SineParameters, SineTrack};
+use livekit::RoomEvent;
 use serial_test::serial;
 use std::sync::{Arc, Weak};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 mod common;
 
@@ -77,6 +79,82 @@ async fn local_participant_holder_probe() -> Result<()> {
     print_weak("local_participant_released RtcSession", &rtc_session);
 
     Ok(())
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn subscriber_track_subscribed_close_does_not_resurrect_publication_cycle() -> Result<()> {
+    const ITERATIONS: usize = 10;
+    let mut survivors = 0;
+
+    for iteration in 1..=ITERATIONS {
+        let mut rooms = common::test_rooms(2).await?;
+        let (publisher_room, publisher_events) =
+            rooms.pop().context("test_rooms returned no publisher room")?;
+        let (subscriber_room, mut subscriber_events) =
+            rooms.pop().context("test_rooms returned no subscriber room")?;
+
+        let publisher_room = Arc::new(publisher_room);
+        let mut sine_track = SineTrack::new(
+            publisher_room.clone(),
+            SineParameters { freq: 60.0, amplitude: 1.0, sample_rate: 48_000, num_channels: 1 },
+        );
+        sine_track.publish().await?;
+
+        timeout(Duration::from_secs(15), wait_for_track_subscribed(&mut subscriber_events))
+            .await
+            .context("timed out waiting for TrackSubscribed")??;
+
+        let room_inner = subscriber_room.inner_weak();
+        let engine_inner = subscriber_room.engine_inner_weak();
+        let rtc_session = subscriber_room.rtc_session_weak();
+
+        subscriber_room.close().await.context("subscriber room close failed")?;
+        drop(subscriber_events);
+        drop(subscriber_room);
+
+        sleep(Duration::from_secs(3)).await;
+
+        let room_alive = weak_alive(&room_inner);
+        let engine_alive = weak_alive(&engine_inner);
+        let rtc_alive = weak_alive(&rtc_session);
+        let iteration_survivors =
+            usize::from(room_alive) + usize::from(engine_alive) + usize::from(rtc_alive);
+        survivors += iteration_survivors;
+
+        println!(
+            "LK_LEAK_PROBE subscriber resurrection iteration {iteration}/{ITERATIONS}: \
+             room_alive={room_alive} engine_alive={engine_alive} rtc_alive={rtc_alive} \
+             survivor_count={iteration_survivors}"
+        );
+
+        sine_track.unpublish().await?;
+        publisher_room.close().await.context("publisher room close failed")?;
+        drop(sine_track);
+        drop(publisher_events);
+        drop(publisher_room);
+    }
+
+    assert_eq!(survivors, 0, "subscriber-side weak probes survived across {ITERATIONS} iterations");
+
+    Ok(())
+}
+
+async fn wait_for_track_subscribed(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<RoomEvent>,
+) -> Result<()> {
+    loop {
+        let Some(event) = events.recv().await else {
+            return Err(anyhow!("subscriber event receiver closed before TrackSubscribed"));
+        };
+        if let RoomEvent::TrackSubscribed { .. } = event {
+            return Ok(());
+        }
+    }
+}
+
+fn weak_alive<T>(weak: &Weak<T>) -> bool {
+    weak.upgrade().is_some()
 }
 
 fn print_weak<T>(label: &str, weak: &Weak<T>) {

@@ -84,6 +84,18 @@ pub struct LocalParticipant {
     local: Arc<LocalInfo>,
 }
 
+#[derive(Clone)]
+pub(super) struct WeakLocalParticipant {
+    inner: Weak<ParticipantInner>,
+    local: Weak<LocalInfo>,
+}
+
+impl WeakLocalParticipant {
+    pub(super) fn upgrade(&self) -> Option<LocalParticipant> {
+        Some(LocalParticipant { inner: self.inner.upgrade()?, local: self.local.upgrade()? })
+    }
+}
+
 impl Debug for LocalParticipant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalParticipant")
@@ -142,6 +154,13 @@ impl LocalParticipant {
 
     pub(crate) fn session(&self) -> Option<Arc<RoomSession>> {
         self.local.session.read().as_ref().and_then(|s| s.upgrade())
+    }
+
+    pub(super) fn downgrade(&self) -> WeakLocalParticipant {
+        WeakLocalParticipant {
+            inner: Arc::downgrade(&self.inner),
+            local: Arc::downgrade(&self.local),
+        }
     }
 
     pub(crate) fn internal_track_publications(&self) -> HashMap<TrackSid, TrackPublication> {

@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, Weak},
+};
 
 use libwebrtc::enum_dispatch;
 use livekit_protocol as proto;
@@ -126,6 +130,28 @@ impl Participant {
         match self {
             Participant::Local(p) => p.internal_track_publications(),
             Participant::Remote(p) => p.internal_track_publications(),
+        }
+    }
+
+    fn downgrade(&self) -> WeakParticipant {
+        match self {
+            Participant::Local(p) => WeakParticipant::Local(p.downgrade()),
+            Participant::Remote(p) => WeakParticipant::Remote(p.downgrade()),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum WeakParticipant {
+    Local(local_participant::WeakLocalParticipant),
+    Remote(remote_participant::WeakRemoteParticipant),
+}
+
+impl WeakParticipant {
+    fn upgrade(&self) -> Option<Participant> {
+        match self {
+            WeakParticipant::Local(p) => p.upgrade().map(Participant::Local),
+            WeakParticipant::Remote(p) => p.upgrade().map(Participant::Remote),
         }
     }
 }
@@ -312,6 +338,14 @@ pub(super) fn set_connection_quality(
     inner.info.write().connection_quality = quality;
 }
 
+pub(super) fn mark_disconnected(inner: &Arc<ParticipantInner>) {
+    inner.info.write().state = ParticipantState::Disconnected;
+}
+
+pub(super) fn is_disconnected(inner: &Arc<ParticipantInner>) -> bool {
+    inner.info.read().state == ParticipantState::Disconnected
+}
+
 pub(super) fn on_track_muted(
     inner: &Arc<ParticipantInner>,
     handler: impl Fn(Participant, TrackPublication) + Send + 'static,
@@ -458,12 +492,17 @@ pub(super) fn add_publication(
 
     publication.on_muted({
         let events = inner.events.clone();
-        let participant = participant.clone();
-        let rtc_engine = inner.rtc_engine.clone();
+        let participant = participant.downgrade();
+        let rtc_engine: Weak<RtcEngine> = Arc::downgrade(&inner.rtc_engine);
         move |publication| {
             if let Some(cb) = events.track_muted.lock().as_ref() {
+                let Some(participant) = participant.upgrade() else {
+                    return;
+                };
                 if !publication.is_remote() {
-                    let rtc_engine = rtc_engine.clone();
+                    let Some(rtc_engine) = rtc_engine.upgrade() else {
+                        return;
+                    };
                     let publication_cloned = publication.clone();
                     livekit_runtime::spawn(async move {
                         let engine_request = rtc_engine
@@ -484,12 +523,17 @@ pub(super) fn add_publication(
 
     publication.on_unmuted({
         let events = inner.events.clone();
-        let participant = participant.clone();
-        let rtc_engine = inner.rtc_engine.clone();
+        let participant = participant.downgrade();
+        let rtc_engine: Weak<RtcEngine> = Arc::downgrade(&inner.rtc_engine);
         move |publication| {
             if let Some(cb) = events.track_unmuted.lock().as_ref() {
+                let Some(participant) = participant.upgrade() else {
+                    return;
+                };
                 if !publication.is_remote() {
-                    let rtc_engine = rtc_engine.clone();
+                    let Some(rtc_engine) = rtc_engine.upgrade() else {
+                        return;
+                    };
                     let publication_cloned = publication.clone();
                     livekit_runtime::spawn(async move {
                         let engine_request = rtc_engine

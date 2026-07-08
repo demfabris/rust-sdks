@@ -14,7 +14,10 @@
 
 pub use crate::utils::take_cell::TakeCell;
 use bmrng::unbounded::UnboundedRequestReceiver;
-use futures_util::{Stream, StreamExt};
+use futures_util::{
+    future::{AbortHandle, Abortable},
+    Stream, StreamExt,
+};
 use libwebrtc::{
     native::frame_cryptor::EncryptionState,
     prelude::{
@@ -34,7 +37,7 @@ use livekit_datatrack::{
 };
 use livekit_protocol::{self as proto, encryption};
 use livekit_runtime::JoinHandle;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as SyncMutex, RwLock};
 pub use proto::DisconnectReason;
 use proto::SignalTarget;
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
@@ -501,6 +504,7 @@ macro_rules! room_session {
             remote_dt_input: dt::remote::ManagerInput,
             pub(crate) rpc_client: rpc::RpcClientManager,
             pub(crate) rpc_server: rpc::RpcServerManager,
+            pending_media_track_tasks: SyncMutex<Vec<AbortHandle>>,
             handle: AsyncMutex<Option<Handle>>,
         }
     };
@@ -735,6 +739,7 @@ impl Room {
             remote_dt_input,
             rpc_client: rpc::RpcClientManager::new(),
             rpc_server: rpc::RpcServerManager::new(),
+            pending_media_track_tasks: Default::default(),
             handle: Default::default(),
         });
         inner.local_participant.set_session(Arc::downgrade(&inner));
@@ -1117,6 +1122,12 @@ impl RoomSession {
     async fn close(self: &Arc<Self>, reason: DisconnectReason) -> RoomResult<()> {
         let Some(handle) = self.handle.lock().await.take() else { Err(RoomError::AlreadyClosed)? };
 
+        let pending_media_track_tasks =
+            self.pending_media_track_tasks.lock().drain(..).collect::<Vec<_>>();
+        for task in pending_media_track_tasks {
+            task.abort();
+        }
+
         // remove published tracks
         for (sid, _) in self.local_participant.track_publications().iter() {
             let _ = self.local_participant.unpublish_track(sid).await;
@@ -1310,9 +1321,16 @@ impl RoomSession {
             .cloned();
 
         if let Some(remote_participant) = remote_participant {
-            livekit_runtime::spawn(async move {
-                remote_participant.add_subscribed_media_track(track_id, track, transceiver).await;
-            });
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            self.pending_media_track_tasks.lock().push(abort_handle);
+            livekit_runtime::spawn(Abortable::new(
+                async move {
+                    remote_participant
+                        .add_subscribed_media_track(track_id, track, transceiver)
+                        .await;
+                },
+                abort_registration,
+            ));
         } else {
             // The server should send participant updates before sending a new offer, this should
             // happen
@@ -2068,6 +2086,8 @@ impl RoomSession {
     /// A participant has disconnected
     /// Cleanup the participant and emit an event
     fn handle_participant_disconnect(self: Arc<Self>, remote_participant: RemoteParticipant) {
+        remote_participant.mark_disconnected();
+
         for (sid, _) in remote_participant.track_publications() {
             remote_participant.unpublish_track(&sid);
         }
