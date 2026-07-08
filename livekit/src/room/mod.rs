@@ -482,24 +482,35 @@ impl Default for DataChannelOptions {
     }
 }
 
-pub(crate) struct RoomSession {
-    rtc_engine: Arc<RtcEngine>,
-    sid_promise: Promise<RoomSid>,
-    info: RwLock<RoomInfo>,
-    dispatcher: Dispatcher<RoomEvent>,
-    options: RoomOptions,
-    active_speakers: RwLock<Vec<Participant>>,
-    local_participant: LocalParticipant,
-    remote_participants: RwLock<HashMap<ParticipantIdentity, RemoteParticipant>>,
-    e2ee_manager: E2eeManager,
-    incoming_stream_manager: IncomingStreamManager,
-    pub(crate) outgoing_stream_manager: OutgoingStreamManager,
-    local_dt_input: dt::local::ManagerInput,
-    remote_dt_input: dt::remote::ManagerInput,
-    pub(crate) rpc_client: rpc::RpcClientManager,
-    pub(crate) rpc_server: rpc::RpcServerManager,
-    handle: AsyncMutex<Option<Handle>>,
+macro_rules! room_session {
+    ($vis:vis) => {
+        /// Room session internals exposed only to e2e leak probes.
+        $vis struct RoomSession {
+            rtc_engine: Arc<RtcEngine>,
+            sid_promise: Promise<RoomSid>,
+            info: RwLock<RoomInfo>,
+            dispatcher: Dispatcher<RoomEvent>,
+            options: RoomOptions,
+            active_speakers: RwLock<Vec<Participant>>,
+            local_participant: LocalParticipant,
+            remote_participants: RwLock<HashMap<ParticipantIdentity, RemoteParticipant>>,
+            e2ee_manager: E2eeManager,
+            incoming_stream_manager: IncomingStreamManager,
+            pub(crate) outgoing_stream_manager: OutgoingStreamManager,
+            local_dt_input: dt::local::ManagerInput,
+            remote_dt_input: dt::remote::ManagerInput,
+            pub(crate) rpc_client: rpc::RpcClientManager,
+            pub(crate) rpc_server: rpc::RpcServerManager,
+            handle: AsyncMutex<Option<Handle>>,
+        }
+    };
 }
+
+#[cfg(feature = "__lk-e2e-test")]
+room_session!(pub);
+
+#[cfg(not(feature = "__lk-e2e-test"))]
+room_session!(pub(crate));
 
 struct Handle {
     room_handle: JoinHandle<()>,
@@ -520,6 +531,13 @@ impl Debug for RoomSession {
             .field("name", &info.name)
             .field("rtc_engine", &self.rtc_engine)
             .finish()
+    }
+}
+
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for RoomSession {
+    fn drop(&mut self) {
+        eprintln!("LK_LEAK_PROBE RoomSession::drop");
     }
 }
 
@@ -826,6 +844,24 @@ impl Room {
         self.inner.close(reason).await
     }
 
+    /// Returns a weak handle to the room session for e2e leak probes.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn inner_weak(&self) -> std::sync::Weak<RoomSession> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Returns a weak handle to the RTC engine internals for e2e leak probes.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn engine_inner_weak(&self) -> std::sync::Weak<crate::rtc_engine::EngineInner> {
+        self.inner.rtc_engine.inner_weak()
+    }
+
+    /// Returns a weak handle to the current RTC session for e2e leak probes.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn rtc_session_weak(&self) -> std::sync::Weak<crate::rtc_engine::RtcSession> {
+        self.inner.rtc_engine.session_weak()
+    }
+
     pub async fn simulate_scenario(&self, scenario: SimulateScenario) -> EngineResult<()> {
         self.inner.rtc_engine.simulate_scenario(scenario).await
     }
@@ -1074,7 +1110,7 @@ impl RoomSession {
         Ok(())
     }
 
-    async fn close(&self, reason: DisconnectReason) -> RoomResult<()> {
+    async fn close(self: &Arc<Self>, reason: DisconnectReason) -> RoomResult<()> {
         let Some(handle) = self.handle.lock().await.take() else { Err(RoomError::AlreadyClosed)? };
 
         // remove published tracks
@@ -1095,6 +1131,8 @@ impl RoomSession {
         let _ = handle.room_handle.await;
 
         self.dispatcher.clear();
+        #[cfg(feature = "__lk-e2e-test")]
+        eprintln!("LK_LEAK_PROBE RoomSession::close end strong_count={}", Arc::strong_count(self));
         Ok(())
     }
 

@@ -24,6 +24,10 @@ use tokio::sync::{
     mpsc, oneshot, Notify, RwLock as AsyncRwLock, RwLockReadGuard as AsyncRwLockReadGuard,
 };
 
+#[cfg(feature = "__lk-e2e-test")]
+pub use self::rtc_session::RtcSession;
+#[cfg(not(feature = "__lk-e2e-test"))]
+use self::rtc_session::RtcSession;
 pub use self::rtc_session::{SessionStats, INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD};
 use crate::prelude::ParticipantIdentity;
 use crate::{
@@ -33,7 +37,7 @@ use crate::{
     room::DisconnectReason,
     rtc_engine::{
         lk_runtime::LkRuntime,
-        rtc_session::{RtcSession, SessionEvent, SessionEvents},
+        rtc_session::{SessionEvent, SessionEvents},
     },
     DataPacketKind,
 };
@@ -240,41 +244,52 @@ struct EngineHandle {
     engine_task: Option<(JoinHandle<()>, oneshot::Sender<()>)>,
 }
 
-struct EngineInner {
-    // Keep a strong reference to LkRuntime to avoid creating a new RtcRuntime or PeerConnection
-    // factory accross multiple Rtc sessions
-    #[allow(dead_code)]
-    lk_runtime: Arc<LkRuntime>,
-    engine_tx: EngineEmitter,
-    options: EngineOptions,
+macro_rules! engine_inner {
+    ($vis:vis) => {
+        /// Engine internals exposed only to e2e leak probes.
+        $vis struct EngineInner {
+            // Keep a strong reference to LkRuntime to avoid creating a new RtcRuntime or PeerConnection
+            // factory accross multiple Rtc sessions
+            #[allow(dead_code)]
+            lk_runtime: Arc<LkRuntime>,
+            engine_tx: EngineEmitter,
+            options: EngineOptions,
 
-    close_notifier: Arc<Notify>,
-    running_handle: RwLock<EngineHandle>,
+            close_notifier: Arc<Notify>,
+            running_handle: RwLock<EngineHandle>,
 
-    // The lock is write guarded for the whole reconnection time.
-    // We can simply wait for reconnection by trying to acquire a read lock.
-    // (This also prevents new reconnection to happens if a read guard is still held)
-    reconnecting_lock: AsyncRwLock<()>,
+            // The lock is write guarded for the whole reconnection time.
+            // We can simply wait for reconnection by trying to acquire a read lock.
+            // (This also prevents new reconnection to happens if a read guard is still held)
+            reconnecting_lock: AsyncRwLock<()>,
 
-    // Signalled when a server-requested reconnect wants the next attempt to fire
-    // immediately, collapsing the exponential backoff wait between attempts.
-    retry_now_notify: Arc<Notify>,
-    /// Test-only fault injection: number of upcoming resume attempts to force to
-    /// fail. Each forced failure decrements this counter and makes
-    /// `try_resume_connection` return an error, which exercises the escalation to a
-    /// full reconnect. Always 0 in production builds.
-    #[cfg(feature = "__lk-e2e-test")]
-    fail_resume_attempts: std::sync::atomic::AtomicU32,
+            // Signalled when a server-requested reconnect wants the next attempt to fire
+            // immediately, collapsing the exponential backoff wait between attempts.
+            retry_now_notify: Arc<Notify>,
+            /// Test-only fault injection: number of upcoming resume attempts to force to
+            /// fail. Each forced failure decrements this counter and makes
+            /// `try_resume_connection` return an error, which exercises the escalation to a
+            /// full reconnect. Always 0 in production builds.
+            #[cfg(feature = "__lk-e2e-test")]
+            fail_resume_attempts: std::sync::atomic::AtomicU32,
 
-    /// Test-only fault injection: when set, the next resume attempt simulates a
-    /// transport failure (a server `Leave{Resume}` / PeerConnection `Failed`)
-    /// arriving *concurrently* with the in-flight resume, then proceeds and
-    /// succeeds. Reproduces the production race where a resume reports success
-    /// while a failure was pending — the failure must escalate the *next* cycle to
-    /// a full reconnect. Always false in production builds.
-    #[cfg(feature = "__lk-e2e-test")]
-    fail_transport_during_next_resume: std::sync::atomic::AtomicBool,
+            /// Test-only fault injection: when set, the next resume attempt simulates a
+            /// transport failure (a server `Leave{Resume}` / PeerConnection `Failed`)
+            /// arriving *concurrently* with the in-flight resume, then proceeds and
+            /// succeeds. Reproduces the production race where a resume reports success
+            /// while a failure was pending — the failure must escalate the *next* cycle to
+            /// a full reconnect. Always false in production builds.
+            #[cfg(feature = "__lk-e2e-test")]
+            fail_transport_during_next_resume: std::sync::atomic::AtomicBool,
+        }
+    };
 }
+
+#[cfg(feature = "__lk-e2e-test")]
+engine_inner!(pub);
+
+#[cfg(not(feature = "__lk-e2e-test"))]
+engine_inner!();
 
 pub struct RtcEngine {
     inner: Arc<EngineInner>,
@@ -283,6 +298,16 @@ pub struct RtcEngine {
 impl Debug for RtcEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RtcEngine").finish()
+    }
+}
+
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for RtcEngine {
+    fn drop(&mut self) {
+        eprintln!(
+            "LK_LEAK_PROBE RtcEngine::drop engine_inner_strong_count={}",
+            Arc::strong_count(&self.inner)
+        );
     }
 }
 
@@ -300,6 +325,18 @@ impl RtcEngine {
 
     pub async fn close(&self, reason: DisconnectReason) {
         self.inner.close(reason).await
+    }
+
+    /// Returns a weak handle to the engine internals for e2e leak probes.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn inner_weak(&self) -> std::sync::Weak<EngineInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Returns a weak handle to the current RTC session for e2e leak probes.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn session_weak(&self) -> std::sync::Weak<RtcSession> {
+        Arc::downgrade(&self.inner.running_handle.read().session)
     }
 
     pub async fn publish_data(
@@ -416,6 +453,13 @@ impl RtcEngine {
 
     pub fn session(&self) -> Arc<RtcSession> {
         self.inner.running_handle.read().session.clone()
+    }
+}
+
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for EngineInner {
+    fn drop(&mut self) {
+        eprintln!("LK_LEAK_PROBE EngineInner::drop");
     }
 }
 
@@ -716,7 +760,7 @@ impl EngineInner {
 
     /// Close the engine
     /// the RtcSession is not removed so we can still access stats for e.g
-    async fn close(&self, reason: DisconnectReason) {
+    async fn close(self: &Arc<Self>, reason: DisconnectReason) {
         let (session, engine_task) = {
             let mut running_handle = self.running_handle.write();
             running_handle.closed = true;
@@ -745,6 +789,8 @@ impl EngineInner {
         // `close()` from inside the task, so notifying earlier could let the
         // top-level select drop the task mid-`close()` and leave teardown partial.
         self.close_notifier.notify_waiters();
+        #[cfg(feature = "__lk-e2e-test")]
+        eprintln!("LK_LEAK_PROBE EngineInner::close end strong_count={}", Arc::strong_count(self));
     }
 
     /// When waiting for reconnection, it ensures we're always using the latest session.

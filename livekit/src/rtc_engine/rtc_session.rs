@@ -433,6 +433,13 @@ impl Debug for RtcSession {
     }
 }
 
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for RtcSession {
+    fn drop(&mut self) {
+        eprintln!("LK_LEAK_PROBE RtcSession::drop");
+    }
+}
+
 struct SessionHandle {
     close_tx: watch::Sender<bool>, // false = is_running
     signal_task: JoinHandle<()>,
