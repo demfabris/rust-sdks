@@ -289,7 +289,7 @@ macro_rules! engine_inner {
 engine_inner!(pub);
 
 #[cfg(not(feature = "__lk-e2e-test"))]
-engine_inner!();
+engine_inner!(pub(crate));
 
 pub struct RtcEngine {
     inner: Arc<EngineInner>,
