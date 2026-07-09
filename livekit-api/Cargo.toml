@@ -44,7 +44,10 @@ __signal-client-async-compatible = [
 ]
 
 
-services-tokio = ["dep:reqwest"]
+# http2 is explicit: without it the services client only speaks HTTP/1.1
+# unless some other crate in the dependent workspace happens to unify the
+# feature in, and the h2 keep-alive settings in http_client need the stack.
+services-tokio = ["dep:reqwest", "reqwest?/http2"]
 services-async = ["dep:isahc"]
 access-token = ["dep:jsonwebtoken"]
 webhooks = ["access-token", "dep:serde_json", "dep:base64"]
@@ -114,3 +117,7 @@ device-info = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "macros", "io-util"] }
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }

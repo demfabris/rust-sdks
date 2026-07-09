@@ -17,6 +17,34 @@ mod tokio {
     #[cfg(feature = "services-tokio")]
     pub use reqwest::Client;
 
+    /// Build the long-lived services client with dead-connection detection.
+    ///
+    /// The twirp clients keep one pooled HTTP/2 connection per host and
+    /// multiplex every request onto it. A connection whose network path dies
+    /// silently (no RST, no GOAWAY — e.g. an LB node going dark) stays
+    /// "alive" to hyper for as long as kernel TCP retransmission keeps
+    /// trying (~15 minutes), and every request issued in that window hangs
+    /// with no error. HTTP/2 keep-alive PINGs bound that blind spot: a dead
+    /// connection is detected within interval + timeout and evicted from the
+    /// pool, so the next request opens a fresh connection.
+    ///
+    /// No global request timeout on purpose: SIP calls like
+    /// `CreateSIPParticipant(wait_until_answered)` legitimately block for a
+    /// full ring cycle; callers own their deadlines.
+    #[cfg(feature = "services-tokio")]
+    pub fn new_client() -> Client {
+        use std::time::Duration;
+
+        Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .http2_keep_alive_timeout(Duration::from_secs(5))
+            .http2_keep_alive_while_idle(true)
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest services client")
+    }
+
     /// GET with an `Authorization: Bearer <token>` header attached.
     ///
     /// `reqwest::get(url)` (the free function) constructs a fresh default
@@ -112,6 +140,13 @@ mod async_std {
             pub fn new() -> Self {
                 Self(isahc::HttpClient::new().unwrap())
             }
+        }
+
+        /// Parity shim with the tokio module so `TwirpClient` can construct
+        /// its client runtime-agnostically. isahc manages its own connection
+        /// health; the reqwest-side keep-alive rationale does not apply here.
+        pub fn new_client() -> Client {
+            Client::new()
         }
 
         impl Client {

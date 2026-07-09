@@ -86,11 +86,23 @@ pub struct TwirpClient {
 
 impl TwirpClient {
     pub fn new(host: &str, pkg: &str, prefix: Option<&str>) -> Self {
+        Self::with_client(http_client::new_client(), host, pkg, prefix)
+    }
+
+    /// Construct with a caller-provided HTTP client. Lets tests inject
+    /// prior-knowledge h2c or custom keep-alive settings; production code
+    /// should prefer [`TwirpClient::new`].
+    pub fn with_client(
+        client: http_client::Client,
+        host: &str,
+        pkg: &str,
+        prefix: Option<&str>,
+    ) -> Self {
         Self {
             host: host.to_owned(),
             pkg: pkg.to_owned(),
             prefix: prefix.unwrap_or(DEFAULT_PREFIX).to_owned(),
-            client: http_client::Client::new(),
+            client,
         }
     }
 

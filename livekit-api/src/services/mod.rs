@@ -28,7 +28,7 @@ pub mod ingress;
 pub mod room;
 pub mod sip;
 
-mod twirp_client;
+pub mod twirp_client;
 
 pub const LIVEKIT_PACKAGE: &str = "livekit";
 
