@@ -301,7 +301,14 @@ int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
 }
 
 int32_t AdmProxy::Init() {
-  // Init is a no-op - Platform ADM is created lazily via AcquirePlatformAdm()
+  // Platform ADM is still created lazily via AcquirePlatformAdm(), but the
+  // synthetic device must be re-initializable: it is the only frame pull
+  // driver on headless servers, and without this call a Terminate() leaves
+  // the process permanently unable to deliver remote audio.
+  webrtc::MutexLock lock(&mutex_);
+  if (synthetic_adm_) {
+    return synthetic_adm_->Init();
+  }
   return 0;
 }
 

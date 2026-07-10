@@ -20,6 +20,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll, Waker},
+    time::Instant,
 };
 
 use cxx::SharedPtr;
@@ -34,6 +35,8 @@ pub struct NativeAudioStream {
     native_sink: SharedPtr<sys_at::ffi::NativeAudioSink>,
     audio_track: RtcAudioTrack,
     frame_queue: Arc<AudioFrameQueue>,
+    observer: Arc<AudioTrackObserver>,
+    created_at: Instant,
 }
 
 impl NativeAudioStream {
@@ -44,7 +47,12 @@ impl NativeAudioStream {
         queue_size_frames: Option<usize>,
     ) -> Self {
         let frame_queue = Arc::new(AudioFrameQueue::new(queue_size_frames));
-        let observer = Arc::new(AudioTrackObserver { frame_queue: frame_queue.clone() });
+        let observer = Arc::new(AudioTrackObserver {
+            frame_queue: frame_queue.clone(),
+            track_id: audio_track.id(),
+            created_at: Instant::now(),
+            received_frame: AtomicBool::new(false),
+        });
         let native_sink = sys_at::ffi::new_native_audio_sink(
             Box::new(sys_at::AudioSinkWrapper::new(observer.clone())),
             sample_rate,
@@ -54,7 +62,8 @@ impl NativeAudioStream {
         let audio = unsafe { sys_at::ffi::media_to_audio(audio_track.sys_handle()) };
         audio.add_sink(&native_sink);
 
-        Self { native_sink, audio_track, frame_queue }
+        let created_at = observer.created_at;
+        Self { native_sink, audio_track, frame_queue, observer, created_at }
     }
 
     pub fn track(&self) -> RtcAudioTrack {
@@ -64,6 +73,21 @@ impl NativeAudioStream {
     pub fn close(&mut self) {
         let audio = unsafe { sys_at::ffi::media_to_audio(self.audio_track.sys_handle()) };
         audio.remove_sink(&self.native_sink);
+
+        // A stream that lived long enough to expect media but never saw a
+        // single frame means the delivery path below the sink was broken
+        // (not merely a short-lived subscription).
+        if !self.frame_queue.closed.load(Ordering::Acquire)
+            && !self.observer.received_frame.load(Ordering::Relaxed)
+            && self.created_at.elapsed().as_secs() >= 2
+        {
+            log::warn!(
+                target: "libwebrtc",
+                "audio stream for track {} closed after {:?} with ZERO frames delivered",
+                self.observer.track_id,
+                self.created_at.elapsed(),
+            );
+        }
 
         self.frame_queue.close();
     }
@@ -85,10 +109,23 @@ impl Stream for NativeAudioStream {
 
 pub struct AudioTrackObserver {
     frame_queue: Arc<AudioFrameQueue>,
+    track_id: String,
+    created_at: Instant,
+    received_frame: AtomicBool,
 }
 
 impl sys_at::AudioSink for AudioTrackObserver {
     fn on_data(&self, data: &[i16], sample_rate: i32, nb_channels: usize, nb_frames: usize) {
+        if !self.received_frame.load(Ordering::Relaxed)
+            && !self.received_frame.swap(true, Ordering::Relaxed)
+        {
+            log::info!(
+                target: "libwebrtc",
+                "first audio frame for track {} after {:?}",
+                self.track_id,
+                self.created_at.elapsed(),
+            );
+        }
         self.frame_queue.push(AudioFrame {
             data: data.to_owned().into(),
             sample_rate: sample_rate as u32,

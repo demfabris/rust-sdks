@@ -16,6 +16,8 @@
 
 #include "livekit/synthetic_audio_device.h"
 
+#include "rtc_base/logging.h"
+
 const int kSampleRate = 48000;
 const int kChannels = 2;
 const int kBytesPerSample = kChannels * sizeof(int16_t);
@@ -38,6 +40,15 @@ int32_t SyntheticAudioDevice::ActiveAudioLayer(AudioLayer* audioLayer) const {
 
 int32_t SyntheticAudioDevice::RegisterAudioCallback(webrtc::AudioTransport* transport) {
   webrtc::MutexLock lock(&mutex_);
+  if (transport == nullptr) {
+    // Only WebRtcVoiceEngine teardown does this; mid-run it means every
+    // remote audio sink in the process goes permanently silent.
+    RTC_LOG(LS_ERROR) << "SyntheticAudioDevice: audio transport UNREGISTERED"
+                      << " (ticks=" << tick_count_.load(std::memory_order_relaxed)
+                      << ")";
+  } else {
+    RTC_LOG(LS_WARNING) << "SyntheticAudioDevice: audio transport registered";
+  }
   audio_transport_ = transport;
   return 0;
 }
@@ -53,8 +64,6 @@ int32_t SyntheticAudioDevice::Init() {
 
   audio_task_ =
       webrtc::RepeatingTaskHandle::Start(audio_queue_.get(), [this]() {
-        webrtc::MutexLock lock(&mutex_);
-
         // Pump unconditionally (not gated on playing_): NeedMorePlayData is
         // what pulls decoded audio out of every receiving stream in the
         // process, and playing_ mirrors AudioState's receiving-stream
@@ -64,7 +73,27 @@ int32_t SyntheticAudioDevice::Init() {
         // which never happens on a busy server. An idle pull against the
         // mixer is just silence; gating it buys nothing on a synthetic
         // device.
-        if (audio_transport_ != nullptr) {
+        webrtc::AudioTransport* transport = nullptr;
+        bool playing = false;
+        {
+          webrtc::MutexLock lock(&mutex_);
+          transport = audio_transport_;
+          playing = playing_;
+        }
+
+        // Heartbeat on the first tick and every ~60s after. Other threads
+        // block on mutex_ (e.g. AudioState checks Playing() on every stream
+        // start), so the pull below must run outside the lock — and if this
+        // line ever stops appearing, the process-wide audio pull is dead
+        // and every remote track will read as silent.
+        uint64_t ticks = tick_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ticks == 1 || ticks % 6000 == 0) {
+          RTC_LOG(LS_WARNING) << "SyntheticAudioDevice pump alive ticks=" << ticks
+                              << " transport=" << (transport != nullptr)
+                              << " playing=" << playing;
+        }
+
+        if (transport != nullptr) {
           int64_t elapsed_time_ms = -1;
           int64_t ntp_time_ms = -1;
           size_t n_samples_out = 0;
@@ -72,7 +101,7 @@ int32_t SyntheticAudioDevice::Init() {
 
           // Request the AudioData, otherwise WebRTC will ignore the packets.
           // 10ms of audio data.
-          audio_transport_->NeedMorePlayData(
+          transport->NeedMorePlayData(
               kSamplesPer10Ms, kBytesPerSample, kChannels, kSampleRate, data,
               n_samples_out, &elapsed_time_ms, &ntp_time_ms);
         }
@@ -80,6 +109,7 @@ int32_t SyntheticAudioDevice::Init() {
         return webrtc::TimeDelta::Millis(10);
       });
 
+  RTC_LOG(LS_WARNING) << "SyntheticAudioDevice: pump task queue started";
   initialized_ = true;
   return 0;
 }
@@ -92,6 +122,11 @@ int32_t SyntheticAudioDevice::Terminate() {
 
     initialized_ = false;
   }
+  // Past this point no remote audio sink in the process receives frames
+  // until Init() runs again. Expected only at factory teardown.
+  RTC_LOG(LS_ERROR) << "SyntheticAudioDevice::Terminate: pump task queue destroyed"
+                    << " (ticks=" << tick_count_.load(std::memory_order_relaxed)
+                    << ")";
   audio_queue_ = nullptr;
   return 0;
 }
