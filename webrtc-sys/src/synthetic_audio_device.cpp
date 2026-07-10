@@ -55,7 +55,16 @@ int32_t SyntheticAudioDevice::Init() {
       webrtc::RepeatingTaskHandle::Start(audio_queue_.get(), [this]() {
         webrtc::MutexLock lock(&mutex_);
 
-        if (playing_) {
+        // Pump unconditionally (not gated on playing_): NeedMorePlayData is
+        // what pulls decoded audio out of every receiving stream in the
+        // process, and playing_ mirrors AudioState's receiving-stream
+        // zero-crossings. If that accounting ever misfires under concurrent
+        // connect/teardown churn, a playing_=false stuck state silences every
+        // remote track in the process until the count next touches zero —
+        // which never happens on a busy server. An idle pull against the
+        // mixer is just silence; gating it buys nothing on a synthetic
+        // device.
+        if (audio_transport_ != nullptr) {
           int64_t elapsed_time_ms = -1;
           int64_t ntp_time_ms = -1;
           size_t n_samples_out = 0;
