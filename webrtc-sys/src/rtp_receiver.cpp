@@ -22,6 +22,7 @@
 #include "absl/types/optional.h"
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
+#include "rtc_base/logging.h"
 
 namespace livekit_ffi {
 
@@ -31,7 +32,13 @@ RtpReceiver::RtpReceiver(
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection)
     : rtc_runtime_(rtc_runtime),
       receiver_(std::move(receiver)),
-      peer_connection_(std::move(peer_connection)) {}
+      peer_connection_(std::move(peer_connection)) {
+  RTC_LOG(LS_VERBOSE) << "RtpReceiver::RtpReceiver() " << this;
+}
+
+RtpReceiver::~RtpReceiver() {
+  RTC_LOG(LS_VERBOSE) << "RtpReceiver::~RtpReceiver() " << this;
+}
 
 std::shared_ptr<MediaStreamTrack> RtpReceiver::track() const {
   return rtc_runtime_->get_or_create_media_stream_track(receiver_->track());

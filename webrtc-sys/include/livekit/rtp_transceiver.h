@@ -46,6 +46,8 @@ class RtpTransceiver {
       webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver,
       webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection);
 
+  ~RtpTransceiver();
+
   MediaType media_type() const;
 
   rust::String mid() const;

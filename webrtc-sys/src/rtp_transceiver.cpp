@@ -18,6 +18,7 @@
 
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
+#include "rtc_base/logging.h"
 
 namespace livekit_ffi {
 
@@ -42,7 +43,13 @@ RtpTransceiver::RtpTransceiver(
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection)
     : rtc_runtime_(rtc_runtime),
       transceiver_(std::move(transceiver)),
-      peer_connection_(std::move(peer_connection)) {}
+      peer_connection_(std::move(peer_connection)) {
+  RTC_LOG(LS_VERBOSE) << "RtpTransceiver::RtpTransceiver() " << this;
+}
+
+RtpTransceiver::~RtpTransceiver() {
+  RTC_LOG(LS_VERBOSE) << "RtpTransceiver::~RtpTransceiver() " << this;
+}
 
 MediaType RtpTransceiver::media_type() const {
   return static_cast<MediaType>(transceiver_->media_type());

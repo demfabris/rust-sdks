@@ -36,6 +36,8 @@ class MediaStreamTrack {
                    webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track);
 
  public:
+  ~MediaStreamTrack();
+
   rust::String kind() const;
   rust::String id() const;
 

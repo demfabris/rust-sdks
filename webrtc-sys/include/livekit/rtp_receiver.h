@@ -43,6 +43,8 @@ class RtpReceiver {
       webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver,
       webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection);
 
+  ~RtpReceiver();
+
   std::shared_ptr<MediaStreamTrack> track() const;
 
   void get_stats(
