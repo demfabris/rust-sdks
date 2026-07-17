@@ -69,7 +69,31 @@ impl Debug for RemoteTrackPublication {
     }
 }
 
+/// Weak handle used by track callbacks so a publication's own track never
+/// keeps the publication alive (publication -> track -> callback ->
+/// publication is an Arc cycle otherwise).
+pub(crate) struct WeakRemoteTrackPublication {
+    inner: std::sync::Weak<TrackPublicationInner>,
+    remote: std::sync::Weak<RemoteInner>,
+}
+
+impl WeakRemoteTrackPublication {
+    pub(crate) fn upgrade(&self) -> Option<RemoteTrackPublication> {
+        Some(RemoteTrackPublication {
+            inner: self.inner.upgrade()?,
+            remote: self.remote.upgrade()?,
+        })
+    }
+}
+
 impl RemoteTrackPublication {
+    pub(crate) fn downgrade(&self) -> WeakRemoteTrackPublication {
+        WeakRemoteTrackPublication {
+            inner: Arc::downgrade(&self.inner),
+            remote: Arc::downgrade(&self.remote),
+        }
+    }
+
     pub(crate) fn new(
         info: proto::TrackInfo,
         track: Option<RemoteTrack>,

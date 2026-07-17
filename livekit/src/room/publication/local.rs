@@ -41,11 +41,35 @@ impl Debug for LocalTrackPublication {
     }
 }
 
+/// Weak handle used by track callbacks so a publication's own track never
+/// keeps the publication alive (publication -> track -> callback ->
+/// publication is an Arc cycle otherwise).
+pub(crate) struct WeakLocalTrackPublication {
+    inner: std::sync::Weak<TrackPublicationInner>,
+    local: std::sync::Weak<LocalInfo>,
+}
+
+impl WeakLocalTrackPublication {
+    pub(crate) fn upgrade(&self) -> Option<LocalTrackPublication> {
+        Some(LocalTrackPublication {
+            inner: self.inner.upgrade()?,
+            local: self.local.upgrade()?,
+        })
+    }
+}
+
 impl LocalTrackPublication {
     pub(crate) fn new(info: proto::TrackInfo, track: LocalTrack) -> Self {
         Self {
             inner: super::new_inner(info, Some(track.into())),
             local: Arc::new(LocalInfo::default()),
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakLocalTrackPublication {
+        WeakLocalTrackPublication {
+            inner: Arc::downgrade(&self.inner),
+            local: Arc::downgrade(&self.local),
         }
     }
 

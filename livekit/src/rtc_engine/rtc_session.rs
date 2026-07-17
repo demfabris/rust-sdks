@@ -1790,6 +1790,22 @@ impl SessionInner {
         if let Some(ref sub_pc) = self.subscriber_pc {
             sub_pc.close();
         }
+
+        // Clear DataChannel callbacks: `on_buffered_amount_change` captures a
+        // clone of its own DataChannel (dc -> closure -> dc Arc cycle), so a
+        // session-owned DC would otherwise never be destroyed after close.
+        for dc in [&self.reliable_dc, &self.lossy_dc, &self.data_track_dc] {
+            dc.on_message(None);
+            dc.on_buffered_amount_change(None);
+            dc.on_state_change(None);
+        }
+        for slot in [&self.sub_reliable_dc, &self.sub_lossy_dc, &self.sub_data_track_dc] {
+            if let Some(dc) = slot.lock().as_ref() {
+                dc.on_message(None);
+                dc.on_buffered_amount_change(None);
+                dc.on_state_change(None);
+            }
+        }
     }
 
     async fn simulate_scenario(self: &Arc<Self>, scenario: SimulateScenario) -> EngineResult<()> {

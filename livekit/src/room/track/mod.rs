@@ -174,12 +174,26 @@ pub(super) struct TrackInner {
     events: Mutex<TrackEvents>,
 }
 
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for TrackInner {
+    fn drop(&mut self) {
+        eprintln!(
+            "LK_LEAK_PROBE TrackInner::drop sid={} kind={:?} has_transceiver={}",
+            self.info.read().sid,
+            self.info.read().kind,
+            self.info.read().transceiver.is_some(),
+        );
+    }
+}
+
 pub(super) fn new_inner(
     sid: TrackSid,
     name: String,
     kind: TrackKind,
     rtc_track: MediaStreamTrack,
 ) -> TrackInner {
+    #[cfg(feature = "__lk-e2e-test")]
+    eprintln!("LK_LEAK_PROBE TrackInner::new sid={sid} kind={kind:?}");
     TrackInner {
         info: RwLock::new(TrackInfo {
             sid,

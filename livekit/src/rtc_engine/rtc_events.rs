@@ -155,7 +155,15 @@ pub fn forward_pc_events(transport: &mut PeerTransport, rtc_emitter: RtcEmitter)
 }
 
 fn on_message(emitter: RtcEmitter, kind: DataPacketKind) -> rtc::data_channel::OnMessage {
+    // Weak: this closure is stored on a DataChannel that may itself be queued
+    // inside the very channel `emitter` sends into (RtcEvent::DataChannel). A
+    // strong sender there means a queued-but-unconsumed event keeps its own
+    // channel (and every other queued native handle) alive forever.
+    let emitter = emitter.downgrade();
     Box::new(move |buffer| {
+        let Some(emitter) = emitter.upgrade() else {
+            return;
+        };
         let _ = emitter.send(RtcEvent::Data {
             data: buffer.data.to_vec(),
             binary: buffer.binary,
@@ -169,7 +177,14 @@ fn on_buffered_amount_change(
     dc: DataChannel,
     kind: DataPacketKind,
 ) -> rtc::data_channel::OnBufferedAmountChange {
+    // Weak emitter for the same reason as `on_message`. The `dc` capture is a
+    // self-reference (closure stored on `dc` itself) — that cycle is broken by
+    // SessionInner::close clearing DC callbacks.
+    let emitter = emitter.downgrade();
     Box::new(move |sent| {
+        let Some(emitter) = emitter.upgrade() else {
+            return;
+        };
         let amount = dc.buffered_amount();
         let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, amount, kind });
     })

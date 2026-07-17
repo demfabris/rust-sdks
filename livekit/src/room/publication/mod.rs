@@ -46,7 +46,33 @@ pub enum TrackPublication {
     Remote(RemoteTrackPublication),
 }
 
+/// Weak counterpart of [`TrackPublication`] for callbacks stored on the
+/// publication's own track (see `set_track`): a strong capture there seals a
+/// publication -> track -> callback -> publication Arc cycle that outlives
+/// room close whenever a subscription is still live at teardown, pinning the
+/// RtpTransceiver wrapper and with it the native PeerConnection.
+pub(crate) enum WeakTrackPublication {
+    Local(crate::room::publication::local::WeakLocalTrackPublication),
+    Remote(crate::room::publication::remote::WeakRemoteTrackPublication),
+}
+
+impl WeakTrackPublication {
+    pub(crate) fn upgrade(&self) -> Option<TrackPublication> {
+        match self {
+            Self::Local(weak) => weak.upgrade().map(TrackPublication::Local),
+            Self::Remote(weak) => weak.upgrade().map(TrackPublication::Remote),
+        }
+    }
+}
+
 impl TrackPublication {
+    pub(crate) fn downgrade(&self) -> WeakTrackPublication {
+        match self {
+            Self::Local(publication) => WeakTrackPublication::Local(publication.downgrade()),
+            Self::Remote(publication) => WeakTrackPublication::Remote(publication.downgrade()),
+        }
+    }
+
     enum_dispatch!(
         [Local, Remote];
         pub fn sid(self: &Self) -> TrackSid;
@@ -112,6 +138,17 @@ struct PublicationEvents {
 pub(super) struct TrackPublicationInner {
     info: RwLock<PublicationInfo>,
     events: Arc<PublicationEvents>,
+}
+
+#[cfg(feature = "__lk-e2e-test")]
+impl Drop for TrackPublicationInner {
+    fn drop(&mut self) {
+        eprintln!(
+            "LK_LEAK_PROBE TrackPublicationInner::drop sid={} has_track={}",
+            self.info.read().sid,
+            self.info.read().track.is_some(),
+        );
+    }
 }
 
 /// Returns whether a `TrackInfo` represents a simulcasted publication.
@@ -196,20 +233,29 @@ pub(super) fn set_track(
 
         track.on_muted({
             let events = inner.events.clone();
-            let publication = publication.clone();
+            // Weak: this closure is stored on the track the publication owns,
+            // so a strong publication capture is a self-sealing Arc cycle.
+            let publication = publication.downgrade();
             move |_| {
+                let Some(publication) = publication.upgrade() else {
+                    return;
+                };
                 if let Some(on_muted) = events.muted.lock().as_ref() {
-                    on_muted(publication.clone());
+                    on_muted(publication);
                 }
             }
         });
 
         track.on_unmuted({
             let events = inner.events.clone();
-            let publication = publication.clone();
+            // Weak: same cycle as on_muted above.
+            let publication = publication.downgrade();
             move |_| {
+                let Some(publication) = publication.upgrade() else {
+                    return;
+                };
                 if let Some(on_unmuted) = events.unmuted.lock().as_ref() {
-                    on_unmuted(publication.clone());
+                    on_unmuted(publication);
                 }
             }
         });
