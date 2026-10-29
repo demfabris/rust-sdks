@@ -203,3 +203,123 @@ impl From<AudioSourceOptions> for sys_at::ffi::AudioSourceOptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        pin::pin,
+        sync::mpsc,
+        task::{Context, Poll, Waker},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use cxx::SharedPtr;
+
+    use super::{sys_at, NativeAudioSource};
+    use crate::{audio_frame::AudioFrame, audio_source::AudioSourceOptions};
+
+    const SAMPLE_RATE: u32 = 48_000;
+    const QUEUE_SIZE_MS: u32 = 100;
+
+    // A buffered source drains its queue on an "AudioSourceCapture" task every
+    // 10 ms. Dropping the source used to free the queue's vectors before that
+    // task stopped, so a tick racing the drop wrote into freed memory (SIGSEGV
+    // in memmove, or a later malloc abort). Drop each source, with audio still
+    // queued, at a different offset around the task's second run. ASan flags
+    // the race on the first hit; without ASan it may show up as a crash here
+    // or in a later test.
+    #[test]
+    fn drop_buffered_sources_while_capture_task_runs() {
+        const THREADS: usize = 64;
+        const DROPS_PER_THREAD: usize = 150;
+
+        let samples = (SAMPLE_RATE / 1000 * QUEUE_SIZE_MS) as usize;
+
+        thread::scope(|s| {
+            for t in 0..THREADS {
+                s.spawn(move || {
+                    let frame = AudioFrame {
+                        data: vec![0x4141 + t as i16; samples].into(),
+                        sample_rate: SAMPLE_RATE,
+                        num_channels: 1,
+                        samples_per_channel: samples as u32,
+                    };
+                    for i in 0..DROPS_PER_THREAD {
+                        let created = Instant::now();
+                        let source = NativeAudioSource::new(
+                            AudioSourceOptions::default(),
+                            SAMPLE_RATE,
+                            1,
+                            QUEUE_SIZE_MS,
+                        );
+                        capture_now(&source, &frame);
+                        // The task runs once right away, then every 10 ms.
+                        let offset_us = 9_700 + ((i * 7 + t * 13) % 31) as u64 * 20;
+                        let drop_at = created + Duration::from_micros(offset_us);
+                        thread::sleep(drop_at.saturating_duration_since(Instant::now()));
+                        drop(source);
+                    }
+                });
+            }
+        });
+    }
+
+    // The capture task calls on_complete on its own thread. If the callback
+    // drops the last reference, the source is destroyed on that thread, which
+    // must neither join itself (an RTC_CHECK abort in PlatformThread::Finalize)
+    // nor keep using the freed source when the callback returns.
+    #[test]
+    fn last_reference_dropped_from_on_complete() {
+        type Ctx = (SharedPtr<sys_at::ffi::AudioTrackSource>, mpsc::Sender<()>);
+
+        extern "C" fn drop_source(ctx: *const sys_at::SourceContext) {
+            let (source, done) = *unsafe { Box::from_raw(ctx as *mut Ctx) };
+            drop(source);
+            let _ = done.send(());
+        }
+
+        let samples = (SAMPLE_RATE / 1000 * QUEUE_SIZE_MS) as usize;
+        let frame = AudioFrame {
+            data: vec![0x4141; samples].into(),
+            sample_rate: SAMPLE_RATE,
+            num_channels: 1,
+            samples_per_channel: samples as u32,
+        };
+        let source =
+            NativeAudioSource::new(AudioSourceOptions::default(), SAMPLE_RATE, 1, QUEUE_SIZE_MS);
+        // Fills the queue up to the notify threshold, so the next frame's
+        // callback waits for the capture task to drain it (about 100 ms).
+        capture_now(&source, &frame);
+
+        let handle = source.sys_handle();
+        drop(source);
+        let (done_tx, done_rx) = mpsc::channel();
+        let ctx = Box::into_raw(Box::new((handle.clone(), done_tx) as Ctx));
+        let queued = unsafe {
+            handle.capture_frame(
+                &frame.data,
+                SAMPLE_RATE,
+                1,
+                samples,
+                ctx as *const sys_at::SourceContext,
+                sys_at::CompleteCallback(drop_source),
+            )
+        };
+        assert!(queued);
+        drop(handle);
+
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("on_complete never ran");
+        // Give the capture thread time to return into the freed source, if it would.
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // A frame that fits the queue completes inside capture_frame, so one poll
+    // resolves the future.
+    fn capture_now(source: &NativeAudioSource, frame: &AudioFrame<'_>) {
+        let mut capture = pin!(source.capture_frame(frame));
+        let poll = capture.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+    }
+}

@@ -20,6 +20,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <thread>
 
 #include "api/audio_options.h"
 #include "api/audio/audio_frame.h"
@@ -161,27 +162,37 @@ AudioTrackSource::InternalSource::InternalSource(
   audio_task_ = webrtc::RepeatingTaskHandle::Start(
       audio_queue_.get(),
       [this, samples10ms]() {
-        webrtc::MutexLock lock(&mutex_);
-        constexpr int kBitsPerSample = sizeof(int16_t) * 8;
+        void (*on_complete)(const SourceContext*) = nullptr;
+        const SourceContext* capture_userdata = nullptr;
+        {
+          webrtc::MutexLock lock(&mutex_);
+          constexpr int kBitsPerSample = sizeof(int16_t) * 8;
 
-        if (buffer_.size() >= samples10ms) {
-          for (auto sink : sinks_)
-            sink->OnData(buffer_.data(), kBitsPerSample, sample_rate_,
-                         num_channels_, samples10ms / num_channels_);
+          if (buffer_.size() >= samples10ms) {
+            for (auto sink : sinks_)
+              sink->OnData(buffer_.data(), kBitsPerSample, sample_rate_,
+                           num_channels_, samples10ms / num_channels_);
 
-          buffer_.erase(buffer_.begin(), buffer_.begin() + samples10ms);
-        } else {
-          // Always provide a 10ms frame to avoid playout underruns.
-          for (auto sink : sinks_)
-            sink->OnData(silence_buffer_.data(), kBitsPerSample, sample_rate_,
-                         num_channels_, samples10ms / num_channels_);
+            buffer_.erase(buffer_.begin(), buffer_.begin() + samples10ms);
+          } else {
+            // Always provide a 10ms frame to avoid playout underruns.
+            for (auto sink : sinks_)
+              sink->OnData(silence_buffer_.data(), kBitsPerSample, sample_rate_,
+                           num_channels_, samples10ms / num_channels_);
+          }
+
+          if (on_complete_ && buffer_.size() <= notify_threshold_samples_) {
+            on_complete = on_complete_;
+            capture_userdata = capture_userdata_;
+            on_complete_ = nullptr;
+            capture_userdata_ = nullptr;
+          }
         }
 
-        if (on_complete_ && buffer_.size() <= notify_threshold_samples_) {
-          on_complete_(capture_userdata_);
-          on_complete_ = nullptr;
-          capture_userdata_ = nullptr;
-        }
+        // Last and outside the lock: the callback goes into Rust and may drop
+        // the last reference to this source (see ~InternalSource).
+        if (on_complete)
+          on_complete(capture_userdata);
 
         return webrtc::TimeDelta::Millis(10);
       },
@@ -189,6 +200,22 @@ AudioTrackSource::InternalSource::InternalSource(
 }
 
 AudioTrackSource::InternalSource::~InternalSource() {
+  if (!audio_queue_)
+    return;
+
+  // Members are destroyed in reverse order, so without this the vectors the
+  // capture task reads would be freed while the task can still run.
+  if (!audio_queue_->IsCurrent()) {
+    // Delete() joins the capture thread and drops the pending task unrun.
+    audio_queue_ = nullptr;
+    return;
+  }
+
+  // The last reference was dropped from inside the capture task, by the
+  // on_complete_ callback. Stop() keeps the task from being reposted, and
+  // Delete() must run elsewhere: on this thread it would join itself.
+  audio_task_.Stop();
+  std::thread([queue = audio_queue_.release()] { queue->Delete(); }).detach();
 }
 
 bool AudioTrackSource::InternalSource::capture_frame(
