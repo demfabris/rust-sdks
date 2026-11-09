@@ -150,9 +150,14 @@ std::shared_ptr<VideoTrack> RtcRuntime::get_or_create_video_track(
 }
 
 LogSink::LogSink(
-    rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc)
+    rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc,
+    LoggingSeverity min_severity)
     : fnc_(fnc) {
-  webrtc::LogMessage::AddLogToStream(this, webrtc::LoggingSeverity::LS_VERBOSE);
+  // libwebrtc formats a log line only when some sink wants its severity, so
+  // the level registered here decides whether hot paths (ICE checks build
+  // Connection::ToString() per LS_VERBOSE line) pay for logging at all.
+  webrtc::LogMessage::AddLogToStream(
+      this, static_cast<webrtc::LoggingSeverity>(min_severity));
 }
 
 LogSink::~LogSink() {
@@ -165,8 +170,9 @@ void LogSink::OnLogMessage(const std::string& message,
 }
 
 std::unique_ptr<LogSink> new_log_sink(
-    rust::Fn<void(rust::String, LoggingSeverity)> fnc) {
-  return std::make_unique<LogSink>(fnc);
+    rust::Fn<void(rust::String, LoggingSeverity)> fnc,
+    LoggingSeverity min_severity) {
+  return std::make_unique<LogSink>(fnc, min_severity);
 }
 
 rust::String create_random_uuid() {

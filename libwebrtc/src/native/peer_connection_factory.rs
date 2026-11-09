@@ -35,6 +35,28 @@ lazy_static! {
     static ref LOG_SINK: Mutex<Option<UniquePtr<sys_rtc::ffi::LogSink>>> = Default::default();
 }
 
+/// The most verbose libwebrtc severity the `libwebrtc` log target lets
+/// through, read once when the sink is installed. libwebrtc skips formatting
+/// a line no sink wants, so asking for less than `LS_VERBOSE` saves the string
+/// building on every ICE check; with the target off the sink receives nothing.
+/// Mirrors the mapping in the sink: `LS_INFO` logs at debug, `LS_VERBOSE` at
+/// trace.
+fn log_sink_min_severity(enabled: impl Fn(log::Level) -> bool) -> sys_rtc::ffi::LoggingSeverity {
+    use log::Level;
+    use sys_rtc::ffi::LoggingSeverity;
+    if enabled(Level::Trace) {
+        LoggingSeverity::Verbose
+    } else if enabled(Level::Debug) {
+        LoggingSeverity::Info
+    } else if enabled(Level::Warn) {
+        LoggingSeverity::Warning
+    } else if enabled(Level::Error) {
+        LoggingSeverity::Error
+    } else {
+        LoggingSeverity::None
+    }
+}
+
 #[derive(Clone)]
 pub struct PeerConnectionFactory {
     pub(crate) sys_handle: SharedPtr<sys_pcf::ffi::PeerConnectionFactory>,
@@ -44,7 +66,7 @@ impl Default for PeerConnectionFactory {
     fn default() -> Self {
         let mut log_sink = LOG_SINK.lock();
         if log_sink.is_none() {
-            *log_sink = Some(sys_rtc::ffi::new_log_sink(|msg, severity| {
+            let on_log = |msg: String, severity| {
                 let msg = msg.strip_suffix("\r\n").or(msg.strip_suffix('\n')).unwrap_or(&msg);
                 // Preserve severity so warnings/errors survive typical
                 // info-level filters; LS_INFO stays at debug because
@@ -61,7 +83,10 @@ impl Default for PeerConnectionFactory {
                     }
                     _ => log::trace!(target: "libwebrtc", "{}", msg),
                 }
-            }));
+            };
+            let min_severity =
+                log_sink_min_severity(|level| log::log_enabled!(target: "libwebrtc", level));
+            *log_sink = Some(sys_rtc::ffi::new_log_sink(on_log, min_severity));
         }
 
         let sys_handle = sys_pcf::ffi::create_peer_connection_factory();
@@ -338,6 +363,21 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn log_sink_asks_libwebrtc_only_for_levels_the_logger_wants() {
+        use log::Level;
+        use sys_rtc::ffi::LoggingSeverity;
+        let at = |max: Option<Level>| log_sink_min_severity(|level| Some(level) <= max);
+
+        assert!(at(Some(Level::Trace)) == LoggingSeverity::Verbose);
+        // LS_INFO is logged at debug, so debug is the first level that wants it.
+        assert!(at(Some(Level::Debug)) == LoggingSeverity::Info);
+        assert!(at(Some(Level::Info)) == LoggingSeverity::Warning);
+        assert!(at(Some(Level::Warn)) == LoggingSeverity::Warning);
+        assert!(at(Some(Level::Error)) == LoggingSeverity::Error);
+        assert!(at(None) == LoggingSeverity::None);
+    }
 
     #[tokio::test]
     async fn test_peer_connection_factory_and_audio_device_controller_bridge() {
